@@ -21,6 +21,7 @@ int get_host_ip(char *ip_buf, size_t len) {
 }
 
 // 替换 .env 文件中的 DATABASE_URL 的 IP 地址
+// 替换 .env 文件中的 DATABASE_URL 的 IP 地址（保留用户名密码）
 void update_env_file(const char *filename, const char *new_ip) {
     FILE *read_fp = fopen(filename, "r");
     FILE *write_fp = fopen(".env.tmp", "w");
@@ -33,28 +34,34 @@ void update_env_file(const char *filename, const char *new_ip) {
     }
 
     regex_t regex;
-    regcomp(&regex, "^DATABASE_URL=\"mysql://[^@]+@[^:]+:[0-9]+/[^\"\\?]*\"", REG_EXTENDED);
+    regcomp(&regex, "^DATABASE_URL=\"mysql://([^@]*)@([^:]+):([0-9]+)/([^\"\\?]*)(\\?.*)?\"", REG_EXTENDED);
 
     char line[1024];
     while (fgets(line, sizeof(line), read_fp)) {
-        if (regexec(&regex, line, 0, NULL, 0) == 0) {
-            // 匹配成功，进行替换
-            char *start = strstr(line, "@");
-            if (start) {
-                char *colon = strchr(start + 1, ':');
-                if (colon) {
-                    char new_line[1024];
-                    snprintf(new_line, sizeof(new_line),
-                             "DATABASE_URL=\"mysql://%s%s",
-                             new_ip,
-                             colon);  // 保留端口和数据库名
-                    fputs(new_line, write_fp);
-                } else {
-                    fputs(line, write_fp);
-                }
-            } else {
-                fputs(line, write_fp);
-            }
+        regmatch_t matches[6]; // 最多匹配 5 组 + 整体匹配
+        if (regexec(&regex, line, 6, matches, 0) == 0) {
+            // 提取用户名密码部分
+            char userpass[256];
+            int userpass_len = matches[1].rm_eo - matches[1].rm_so;
+            strncpy(userpass, line + matches[1].rm_so, userpass_len);
+            userpass[userpass_len] = '\0';
+
+            // 提取端口和数据库名
+            char port[10], dbname[128];
+            int port_len = matches[3].rm_eo - matches[3].rm_so;
+            int dbname_len = matches[4].rm_eo - matches[4].rm_so;
+            strncpy(port, line + matches[3].rm_so, port_len);
+            port[port_len] = '\0';
+            strncpy(dbname, line + matches[4].rm_so, dbname_len);
+            dbname[dbname_len] = '\0';
+
+            // 构造新的 URL（保留用户信息、端口、数据库名）
+            char new_line[1024];
+            snprintf(new_line, sizeof(new_line),
+                     "DATABASE_URL=\"mysql://%s@%s:%s/%s\"\n",
+                     userpass, new_ip, port, dbname);
+
+            fputs(new_line, write_fp);
         } else {
             fputs(line, write_fp);
         }
