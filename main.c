@@ -1,80 +1,61 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>  // execvp, popen 等
+#include <unistd.h>
 #include <regex.h>
+#include <fcntl.h>
 
-int main(int argc, char *argv[]) {
-    printf("Hello, World!\n");
+// 获取宿主机 IP 地址
+int get_host_ip(char *ip_buf, size_t len) {
+    FILE *fp = popen("ip route show | grep -i default | awk '{ print $3 }'", "r");
+    if (!fp) return -1;
 
-    FILE *fp;
-    char line[1024];
-    char *config_file = "config/database.yml";
-    char *temp_file = "config/database.yml.tmp";
-    char new_ip[128];
-
-    // 获取 WSL 宿主机 IP 地址
-    fp = popen("ip route show | grep -i default | awk '{ print $3 }'", "r");
-    if (fp == NULL) {
-        perror("Failed to run command");
-        return 1;
+    if (fgets(ip_buf, len, fp)) {
+        ip_buf[strcspn(ip_buf, "\n")] = '\0';
+        pclose(fp);
+        return 0;
     }
-    if (fgets(new_ip, sizeof(new_ip), fp) != NULL) {
-        new_ip[strcspn(new_ip, "\n")] = '\0';  // 去除换行符
-    }
+
     pclose(fp);
+    return -1;
+}
 
-    // 打开原文件和临时文件
-    FILE *read_fp = fopen(config_file, "r");
-    FILE *write_fp = fopen(temp_file, "w");
+// 替换 .env 文件中的 DATABASE_URL 的 IP 地址
+void update_env_file(const char *filename, const char *new_ip) {
+    FILE *read_fp = fopen(filename, "r");
+    FILE *write_fp = fopen(".env.tmp", "w");
 
-    if (read_fp == NULL || write_fp == NULL) {
-        perror("Failed to open file");
-        return 1;
+    if (!read_fp || !write_fp) {
+        perror("无法打开 .env 文件");
+        if (read_fp) fclose(read_fp);
+        if (write_fp) fclose(write_fp);
+        return;
     }
 
-    // 正则表达式匹配 host: <%= ENV.fetch("DB_HOST") { "127.0.0.1" } %> 模式
     regex_t regex;
-    regcomp(&regex, "ENV\\.fetch\\(.*?\\) \\{ \".*?\" \\}", REG_EXTENDED);
+    regcomp(&regex, "^DATABASE_URL=\"mysql://[^@]+@[^:]+:[0-9]+/[^\"\\?]*\"", REG_EXTENDED);
 
+    char line[1024];
     while (fgets(line, sizeof(line), read_fp)) {
-        regmatch_t matches[1];
-        if (regexec(&regex, line, 1, matches, 0) == 0) {
+        if (regexec(&regex, line, 0, NULL, 0) == 0) {
             // 匹配成功，进行替换
-            int prefix_len = matches[0].rm_so;
-            int suffix_start = matches[0].rm_eo;
-
-            // 提取前缀部分
-            char prefix[prefix_len + 1];
-            memcpy(prefix, line, prefix_len);
-            prefix[prefix_len] = '\0';
-
-            const char *middle_start = strstr(line + prefix_len, "{ \"");
-            const char *middle_end = strstr(middle_start + 2, "\" }");
-            if (!middle_start || !middle_end) {
-                fputs(line, write_fp);  // 格式不匹配，原样写入
-                continue;
-            }
-
-            // 提取后缀部分
-            char suffix[1024];
-            strcpy(suffix, line + suffix_start);
-
-            // 构造新字符串（使用分步 snprintf 避免溢出警告）
-            char new_line[1024];
-            int n = snprintf(new_line, sizeof(new_line), "%s", prefix);
-            if (n >= 0 && n < sizeof(new_line)) {
-                snprintf(new_line + n, sizeof(new_line) - n,
-                         "ENV.fetch(\"DB_HOST\") { \"%s\" }%s", new_ip, suffix);
+            char *start = strstr(line, "@");
+            if (start) {
+                char *colon = strchr(start + 1, ':');
+                if (colon) {
+                    char new_line[1024];
+                    snprintf(new_line, sizeof(new_line),
+                             "DATABASE_URL=\"mysql://%s%s",
+                             new_ip,
+                             colon);  // 保留端口和数据库名
+                    fputs(new_line, write_fp);
+                } else {
+                    fputs(line, write_fp);
+                }
             } else {
-                // 如果缓冲区太小或出错，降级处理：原样写入
                 fputs(line, write_fp);
-                continue;
             }
-
-            fputs(new_line, write_fp);
         } else {
-            // 不匹配，直接写入原行
             fputs(line, write_fp);
         }
     }
@@ -83,33 +64,108 @@ int main(int argc, char *argv[]) {
     fclose(write_fp);
     regfree(&regex);
 
-    // 替换原文件
-    remove(config_file);
-    rename(temp_file, config_file);
+    remove(filename);
+    rename(".env.tmp", filename);
+}
 
-    // 记录操作日志
-    char log_file_path[256];
-    snprintf(log_file_path, sizeof(log_file_path), "/home/%s/.railsc", getenv("USER"));
-    FILE *log_fp = fopen(log_file_path, "a");
-    if (log_fp != NULL) {
-        fprintf(log_fp, "Updated DB_HOST to %s in %s\n", new_ip, config_file);
-        fclose(log_fp);
+// 替换 config/database.yml 文件中的 DB_HOST
+void update_yaml_file(const char *filename, const char *new_ip) {
+    FILE *read_fp = fopen(filename, "r");
+    FILE *write_fp = fopen("database.yml.tmp", "w");
+
+    if (!read_fp || !write_fp) {
+        perror("无法打开 database.yml 文件");
+        if (read_fp) fclose(read_fp);
+        if (write_fp) fclose(write_fp);
+        return;
     }
 
-    // 转发命令给 rails
-    if (argc <= 1) {
-        fprintf(stderr, "Usage: %s <rails command...>\n", argv[0]);
+    regex_t regex;
+    regcomp(&regex, "ENV\\.fetch\\(.*?\\) \\{ \".*?\" \\}", REG_EXTENDED);
+
+    char line[1024];
+    while (fgets(line, sizeof(line), read_fp)) {
+        regmatch_t matches[1];
+        if (regexec(&regex, line, 1, matches, 0) == 0) {
+            int prefix_len = matches[0].rm_so;
+            int suffix_start = matches[0].rm_eo;
+
+            char prefix[prefix_len + 1];
+            memcpy(prefix, line, prefix_len);
+            prefix[prefix_len] = '\0';
+
+            const char *middle_start = strstr(line + prefix_len, "{ \"");
+            const char *middle_end = strstr(middle_start + 2, "\" }");
+            if (!middle_start || !middle_end) {
+                fputs(line, write_fp);
+                continue;
+            }
+
+            char suffix[1024];
+            strcpy(suffix, line + suffix_start);
+
+            char new_line[1024];
+            int n = snprintf(new_line, sizeof(new_line), "%s", prefix);
+            if (n >= 0 && n < sizeof(new_line)) {
+                snprintf(new_line + n, sizeof(new_line) - n,
+                         "ENV.fetch(\"DB_HOST\") { \"%s\" }%s", new_ip, suffix);
+            } else {
+                fputs(line, write_fp);
+                continue;
+            }
+
+            fputs(new_line, write_fp);
+        } else {
+            fputs(line, write_fp);
+        }
+    }
+
+    fclose(read_fp);
+    fclose(write_fp);
+    regfree(&regex);
+
+    remove(filename);
+    rename("database.yml.tmp", filename);
+}
+
+int main(int argc, char *argv[]) {
+    char new_ip[128];
+
+    // 获取宿主机 IP
+    if (get_host_ip(new_ip, sizeof(new_ip)) != 0) {
+        fprintf(stderr, "获取宿主机 IP 失败\n");
         return 1;
     }
 
-    char *new_argv[argc + 1];
-    new_argv[0] = "rails";
-    memcpy(new_argv + 1, argv + 1, sizeof(char *) * (argc - 1));
-    new_argv[argc] = NULL;
+    printf("检测到宿主机 IP: %s\n", new_ip);
 
-    execvp("rails", new_argv);
+    int is_node = (access(".env", F_OK) != -1);
+    int is_rails = (access("config/database.yml", F_OK) != -1);
+
+    if (!is_node && !is_rails) {
+        fprintf(stderr, "未找到 .env 或 config/database.yml，无法判断项目类型\n");
+        return 1;
+    }
+
+    if (is_node) {
+        printf("检测到 Node.js 项目，更新 .env...\n");
+        update_env_file(".env", new_ip);
+
+        // 执行 npm start
+        printf("启动 npm start ...\n");
+        char *new_argv[] = {"npm", "start", NULL};
+        execvp("npm", new_argv);
+    } else if (is_rails) {
+        printf("检测到 Rails 项目，更新 database.yml...\n");
+        update_yaml_file("config/database.yml", new_ip);
+
+        // 执行 rails server
+        printf("启动 rails server ...\n");
+        char *new_argv[] = {"rails", "server", NULL};
+        execvp("rails", new_argv);
+    }
 
     // 如果走到这里说明 exec 失败
-    perror("Failed to execute rails command");
+    perror("Failed to execute command");
     return 1;
 }
